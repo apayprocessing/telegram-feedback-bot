@@ -4,6 +4,7 @@ import os
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message
@@ -18,14 +19,21 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 GROUP_ID = int(os.getenv("GROUP_ID"))
 DB_PATH = os.getenv("DB_PATH", "feedback.db")
 
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN не задан в .env")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("feedback-bot")
 
+# Таймаут 30 секунд вместо дефолтных 60 — быстрее упадёт, если что-то не так
+session = AiohttpSession(timeout=30)
+
 bot = Bot(
     token=BOT_TOKEN,
+    session=session,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
@@ -33,6 +41,10 @@ dp = Dispatcher()
 
 # -------------------- База данных --------------------
 async def init_db() -> None:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -81,7 +93,7 @@ async def save_topic(user_id: int, topic_id: int, username: str, full_name: str)
         await db.commit()
 
 
-# -------------------- Хендлеры: пользователь --------------------
+# -------------------- Пользователь --------------------
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message) -> None:
     await message.answer(
@@ -95,7 +107,6 @@ async def cmd_start(message: Message) -> None:
 async def user_message(message: Message) -> None:
     user = message.from_user
 
-    # 1. Находим или создаём тему для этого пользователя
     topic_id = await get_topic_by_user(user.id)
 
     if topic_id is None:
@@ -103,14 +114,12 @@ async def user_message(message: Message) -> None:
         try:
             topic = await bot.create_forum_topic(
                 chat_id=GROUP_ID,
-                name=topic_name[:128],  # ограничение Telegram
+                name=topic_name[:128],
             )
             topic_id = topic.message_thread_id
         except Exception:
             logger.exception("Не удалось создать тему")
-            await message.answer(
-                "⚠️ Не удалось создать обращение. Попробуйте позже."
-            )
+            await message.answer("⚠️ Не удалось создать обращение. Попробуйте позже.")
             return
 
         await save_topic(
@@ -120,7 +129,6 @@ async def user_message(message: Message) -> None:
             full_name=user.full_name,
         )
 
-        # Шапка темы с информацией о пользователе
         header = f"👤 <b>{user.full_name}</b>\n"
         if user.username:
             header += f"🔗 @{user.username}\n"
@@ -135,14 +143,12 @@ async def user_message(message: Message) -> None:
         except Exception:
             logger.exception("Не удалось отправить шапку темы")
 
-    # 2. Пересылаем сообщение пользователя в тему
     try:
         await message.forward(
             chat_id=GROUP_ID,
             message_thread_id=topic_id,
         )
     except Exception:
-        # Если пересылка запрещена — копируем
         try:
             await bot.copy_message(
                 chat_id=GROUP_ID,
@@ -158,10 +164,9 @@ async def user_message(message: Message) -> None:
     await message.answer("✅ Сообщение отправлено оператору.")
 
 
-# -------------------- Хендлеры: владелец в группе --------------------
+# -------------------- Владелец в группе --------------------
 @dp.message(F.chat.id == GROUP_ID, F.from_user.id == OWNER_ID)
 async def owner_reply(message: Message) -> None:
-    # Отвечаем пользователю только если владелец ответил через Reply
     if message.reply_to_message is None:
         return
 
@@ -178,7 +183,10 @@ async def owner_reply(message: Message) -> None:
         await message.reply("✅ Отправлено пользователю.")
     except Exception:
         logger.exception("Не удалось отправить ответ пользователю")
-        await message.reply("⚠️ Не удалось отправить ответ. Проверьте, не заблокировал ли бота пользователь.")
+        await message.reply(
+            "⚠️ Не удалось отправить ответ. "
+            "Возможно, пользователь заблокировал бота."
+        )
 
 
 # -------------------- Точка входа --------------------
@@ -186,8 +194,10 @@ async def main() -> None:
     await init_db()
     logger.info("Бот запускается...")
 
-    # Убираем возможный вебхук, чтобы polling работал стабильно
-    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        logger.warning("Не удалось сбросить вебхук, продолжаем.")
 
     await dp.start_polling(bot)
 
