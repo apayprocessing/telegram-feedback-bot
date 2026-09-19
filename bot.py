@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -29,9 +29,8 @@ GROUP_ID = int(os.getenv("GROUP_ID"))
 DB_PATH = os.getenv("DB_PATH", "feedback.db")
 ATTACHMENTS_DIR = os.getenv("ATTACHMENTS_DIR", "attachments")
 
-# Антиспам
 ANTISPAM_LIMIT = int(os.getenv("ANTISPAM_LIMIT", "5"))
-ANTISPAM_WINDOW = int(os.getenv("ANTISPAM_WINDOW", "60"))  # секунд
+ANTISPAM_WINDOW = int(os.getenv("ANTISPAM_WINDOW", "60"))
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN не задан в .env")
@@ -50,7 +49,6 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Глобальное состояние
 logs_topic_id: int | None = None
 user_msg_times: dict[int, list[float]] = defaultdict(list)
 
@@ -175,14 +173,12 @@ async def log_to_topic(text: str) -> None:
 
 
 async def ensure_logs_topic() -> None:
-    """Создаёт или находит тему для логов."""
     global logs_topic_id
 
     saved = await get_meta("logs_topic_id")
     if saved:
         try:
             logs_topic_id = int(saved)
-            # Проверим, что тема ещё существует
             await bot.send_message(
                 chat_id=GROUP_ID,
                 text="🔄 Бот перезапущен",
@@ -212,7 +208,6 @@ async def ensure_logs_topic() -> None:
 def is_spam(user_id: int) -> bool:
     now = time.time()
     times = user_msg_times[user_id]
-    # Убираем старые
     times[:] = [t for t in times if now - t < ANTISPAM_WINDOW]
     if len(times) >= ANTISPAM_LIMIT:
         return True
@@ -262,6 +257,91 @@ async def save_attachment(message: Message, user_id: int) -> str | None:
         return None
 
 
+# -------------------- Темы: создание и доставка --------------------
+async def create_topic_for_user(user) -> int | None:
+    topic_name = f"{user.full_name} | {user.id}"
+    try:
+        topic = await bot.create_forum_topic(
+            chat_id=GROUP_ID,
+            name=topic_name[:128],
+        )
+    except Exception as e:
+        logger.exception("Не удалось создать тему")
+        await log_to_topic(f"Не удалось создать тему для {user.id}: {e}")
+        return None
+
+    topic_id = topic.message_thread_id
+    await save_topic(
+        user_id=user.id,
+        topic_id=topic_id,
+        username=user.username or "",
+        full_name=user.full_name,
+    )
+
+    header = f"👤 <b>{user.full_name}</b>\n"
+    if user.username:
+        header += f"🔗 @{user.username}\n"
+    header += f"🆔 <code>{user.id}</code>"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔒 Закрыть обращение",
+                    callback_data=f"close:{user.id}",
+                )
+            ]
+        ]
+    )
+    try:
+        await bot.send_message(
+            chat_id=GROUP_ID,
+            message_thread_id=topic_id,
+            text=header,
+            reply_markup=kb,
+        )
+    except Exception as e:
+        logger.exception("Не удалось отправить шапку темы")
+        await log_to_topic(f"Шапка темы не отправлена: {e}")
+
+    return topic_id
+
+
+async def deliver_to_topic(message: Message, user, topic_id: int) -> int | None:
+    # Попытка 1: forward
+    try:
+        await message.forward(chat_id=GROUP_ID, message_thread_id=topic_id)
+        return topic_id
+    except Exception as e:
+        logger.warning(f"forward не удался для темы {topic_id}: {e}")
+
+    # Попытка 2: copy
+    try:
+        await bot.copy_message(
+            chat_id=GROUP_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            message_thread_id=topic_id,
+        )
+        return topic_id
+    except Exception as e:
+        logger.warning(f"copy не удался для темы {topic_id}: {e}")
+
+    # Попытка 3: пересоздать тему
+    logger.info(f"Пересоздаём тему для пользователя {user.id}")
+    new_topic_id = await create_topic_for_user(user)
+    if new_topic_id is None:
+        return None
+
+    try:
+        await message.forward(chat_id=GROUP_ID, message_thread_id=new_topic_id)
+        return new_topic_id
+    except Exception as e:
+        logger.exception("Повторная пересылка тоже провалилась")
+        await log_to_topic(f"Не удалось переслать сообщение от {user.id}: {e}")
+        return None
+
+
 # -------------------- Пользователь --------------------
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message) -> None:
@@ -277,7 +357,6 @@ async def cmd_start(message: Message) -> None:
 async def user_message(message: Message) -> None:
     user = message.from_user
 
-    # Антиспам
     if is_spam(user.id):
         await message.answer(
             "⏳ Слишком много сообщений. Подождите минуту и попробуйте снова."
@@ -286,80 +365,18 @@ async def user_message(message: Message) -> None:
 
     topic_id = await get_topic_by_user(user.id)
 
-    # Создаём тему, если её нет
     if topic_id is None:
-        topic_name = f"{user.full_name} | {user.id}"
-        try:
-            topic = await bot.create_forum_topic(
-                chat_id=GROUP_ID,
-                name=topic_name[:128],
-            )
-            topic_id = topic.message_thread_id
-        except Exception:
-            logger.exception("Не удалось создать тему")
+        topic_id = await create_topic_for_user(user)
+        if topic_id is None:
             await message.answer("⚠️ Не удалось создать обращение. Попробуйте позже.")
             return
 
-        await save_topic(
-            user_id=user.id,
-            topic_id=topic_id,
-            username=user.username or "",
-            full_name=user.full_name,
-        )
-
-        # Шапка темы с кнопкой закрытия
-        header = f"👤 <b>{user.full_name}</b>\n"
-        if user.username:
-            header += f"🔗 @{user.username}\n"
-        header += f"🆔 <code>{user.id}</code>"
-
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🔒 Закрыть обращение",
-                        callback_data=f"close:{user.id}",
-                    )
-                ]
-            ]
-        )
-
-        try:
-            await bot.send_message(
-                chat_id=GROUP_ID,
-                message_thread_id=topic_id,
-                text=header,
-                reply_markup=kb,
-            )
-        except Exception:
-            logger.exception("Не удалось отправить шапку темы")
-
-    # Сохраняем вложение, если есть
     await save_attachment(message, user.id)
 
-    # Пересылаем сообщение в тему
-    try:
-        await message.forward(
-            chat_id=GROUP_ID,
-            message_thread_id=topic_id,
-        )
-    except Exception:
-        try:
-            await bot.copy_message(
-                chat_id=GROUP_ID,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-                message_thread_id=topic_id,
-            )
-        except Exception:
-            logger.exception("Не удалось переслать сообщение")
-            await log_to_topic(
-                f"Не удалось переслать сообщение от {user.id}: {message.message_id}"
-            )
-            await message.answer(
-                "⚠️ Не удалось отправить сообщение. Попробуйте ещё раз."
-            )
-            return
+    result_topic = await deliver_to_topic(message, user, topic_id)
+    if result_topic is None:
+        await message.answer("⚠️ Не удалось отправить сообщение. Попробуйте ещё раз.")
+        return
 
     await log_message(user.id, "in")
     await message.answer("✅ Сообщение отправлено оператору.")
@@ -444,7 +461,6 @@ async def owner_reply(message: Message) -> None:
     if thread_id is None:
         return
 
-    # Игнорируем сообщения из темы логов
     if logs_topic_id and thread_id == logs_topic_id:
         return
 
